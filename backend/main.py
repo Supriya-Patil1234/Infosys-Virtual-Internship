@@ -1,4 +1,4 @@
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
@@ -12,12 +12,13 @@ import whisper
 import os
 import torch
 
-from database import engine, SessionLocal
-from models import Base, User, Transcript
+from database import SessionLocal
+from models import User, Transcript
 
-# -----------------------------
+
+# =============================
 # APP INIT
-# -----------------------------
+# =============================
 app = FastAPI()
 
 app.add_middleware(
@@ -28,9 +29,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
+
+# =============================
 # SECURITY CONFIG
-# -----------------------------
+# =============================
 SECRET_KEY = "supersecretkey123"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -38,27 +40,32 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# -----------------------------
+
+# =============================
 # REQUEST MODELS
-# -----------------------------
+# =============================
 class AuthRequest(BaseModel):
     username: str
     password: str
 
-# -----------------------------
+
+# =============================
 # HELPER FUNCTIONS
-# -----------------------------
+# =============================
 def hash_password(password: str):
     return pwd_context.hash(password)
 
+
 def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
+
 
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
 
 def get_db():
     db = SessionLocal()
@@ -67,6 +74,7 @@ def get_db():
     finally:
         db.close()
 
+
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
@@ -74,10 +82,12 @@ def get_current_user(
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
+
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
 
         user = db.query(User).filter(User.id == int(user_id)).first()
+
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
 
@@ -86,62 +96,131 @@ def get_current_user(
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# -----------------------------
+
+# =============================
 # LOAD WHISPER MODEL
-# -----------------------------
+# =============================
 UPLOAD_FOLDER = "uploads"
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 print("Loading Whisper model...")
-whisper_model = whisper.load_model("tiny")
+whisper_model = whisper.load_model("tiny")   # CPU safe
 print("Whisper model loaded")
 
-# -----------------------------
-# LOAD HUGGING FACE T5 MODEL
-# -----------------------------
-print("Loading T5 summarization model...")
-tokenizer = T5Tokenizer.from_pretrained("t5-small")
-t5_model = T5ForConditionalGeneration.from_pretrained("t5-small")
-print("T5 model loaded")
 
+# =============================
+# LOAD FLAN-T5 MODEL
+# =============================
+print("Loading FLAN-T5 summarization model...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(
+    "google/flan-t5-base"
+).to(device)
+
+print("FLAN-T5 model loaded")
+
+
+# =============================
+# CHUNK-BASED SUMMARIZATION
+# =============================
 def generate_summary(text: str):
     if not text.strip():
         return ""
 
-    input_text = "summarize: " + text
-    inputs = tokenizer.encode(
-        input_text,
-        return_tensors="pt",
-        max_length=512,
-        truncation=True
-    )
+    max_chunk_tokens = 400
 
-    outputs = t5_model.generate(
-        inputs,
-        max_length=120,
-        min_length=30,
-        length_penalty=2.0,
-        num_beams=4,
+    # Encode full text
+    token_ids = tokenizer.encode(text, return_tensors="pt", truncation=False)[0]
+
+    chunks = []
+    for i in range(0, len(token_ids), max_chunk_tokens):
+        chunks.append(token_ids[i:i + max_chunk_tokens])
+
+    partial_summaries = []
+
+    for chunk in chunks:
+        chunk_text = tokenizer.decode(chunk, skip_special_tokens=True)
+
+        prompt = f"""
+        Summarize the following transcript clearly and in detail:
+
+        {chunk_text}
+        """
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        ).to(device)
+
+        outputs = summarizer_model.generate(
+            **inputs,
+            max_length=180,
+            min_length=60,
+            num_beams=5,
+            length_penalty=1.0,
+            early_stopping=True
+        )
+
+        summary_chunk = tokenizer.decode(
+            outputs[0],
+            skip_special_tokens=True
+        )
+
+        partial_summaries.append(summary_chunk)
+
+    combined_text = " ".join(partial_summaries)
+
+    final_prompt = f"""
+    Create a well-structured final summary of the following text:
+
+    {combined_text}
+    """
+
+    final_inputs = tokenizer(
+        final_prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512
+    ).to(device)
+
+    final_outputs = summarizer_model.generate(
+        **final_inputs,
+        max_length=220,
+        min_length=80,
+        num_beams=6,
+        length_penalty=1.0,
         early_stopping=True
     )
 
-    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return summary
+    final_summary = tokenizer.decode(
+        final_outputs[0],
+        skip_special_tokens=True
+    )
 
-# -----------------------------
+    return final_summary
+
+
+# =============================
 # ROUTES
-# -----------------------------
+# =============================
+
 @app.get("/")
 def home():
-    return {"message": "Backend running securely with HuggingFace"}
+    return {"message": "Backend running securely with Whisper + FLAN-T5"}
+
 
 # -------- REGISTER --------
 @app.post("/register")
 def register(req: AuthRequest, db: Session = Depends(get_db)):
 
     existing = db.query(User).filter(User.username == req.username).first()
+
     if existing:
         raise HTTPException(status_code=400, detail="User already exists")
 
@@ -152,6 +231,7 @@ def register(req: AuthRequest, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "User created successfully"}
+
 
 # -------- LOGIN --------
 @app.post("/login")
@@ -169,7 +249,8 @@ def login(req: AuthRequest, db: Session = Depends(get_db)):
         "token_type": "bearer"
     }
 
-# -------- UPLOAD (TRANSCRIBE + SUMMARIZE) --------
+
+# -------- UPLOAD --------
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
@@ -182,11 +263,11 @@ async def upload(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Transcription
+    # 1️⃣ Transcription
     result = whisper_model.transcribe(file_path)
     transcript = result["text"]
 
-    # Summarization using Hugging Face
+    # 2️⃣ Summarization
     summary = generate_summary(transcript)
 
     new_record = Transcript(
@@ -206,6 +287,7 @@ async def upload(
         "record_id": new_record.id
     }
 
+
 # -------- HISTORY --------
 @app.get("/history")
 def get_history(
@@ -218,6 +300,7 @@ def get_history(
     ).all()
 
     return records
+
 
 # -------- PROFILE --------
 @app.get("/profile")
@@ -232,5 +315,5 @@ def get_profile(
 
     return {
         "username": current_user.username,
-        "transcript_count": transcript_count  
+        "transcript_count": transcript_count
     }
